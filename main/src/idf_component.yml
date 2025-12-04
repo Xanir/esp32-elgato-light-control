@@ -1,0 +1,5 @@
+# idf_component.yml
+
+dependencies:
+  # Use the Espressif cJSON managed component from the registry
+  espressif/cjson: "*"
