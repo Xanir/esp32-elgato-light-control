@@ -1,0 +1,42 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# ESP-IDF
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+dependencies.lock
+
+# Credentials
+creds/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+
+# Compiled Object files
+*.o
+*.obj
+*.elf
+*.bin
+*.map
+
+# Logs
+*.log
+
+# Local environment
+.env
+*.local
