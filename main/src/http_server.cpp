@@ -1,18 +1,12 @@
 #include <string>
 #include <map>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <errno.h>
 #include <cstring>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_log.h"
 
 extern "C" {
     #include <cJSON.h>
+    #include "esp_http_server.h"
 }
 
 #include "http_server.h"
@@ -20,15 +14,17 @@ extern "C" {
 
 static const char* TAG = "HTTP_SERVER";
 
+// --- Utility Functions ---
+
 /**
  * @brief Converts the device map to a JSON string.
  */
-static std::string device_map_to_json(const std::map<std::string, DeviceInfo>& device_map) {
+static std::string device_map_to_json(const std::map<std::string, DeviceInfo> *device_map) {
     cJSON *root = cJSON_CreateArray();
-    
-    for (const auto& pair : device_map) {
+
+    for (const auto& pair : *device_map) {
         const DeviceInfo& info = pair.second;
-        
+
         cJSON *device = cJSON_CreateObject();
         cJSON_AddStringToObject(device, "serialNumber", info.serialNumber.c_str());
         cJSON_AddStringToObject(device, "ip", info.ip.c_str());
@@ -39,151 +35,318 @@ static std::string device_map_to_json(const std::map<std::string, DeviceInfo>& d
         cJSON_AddNumberToObject(device, "firmwareBuildNumber", info.firmwareBuildNumber);
         cJSON_AddStringToObject(device, "firmwareVersion", info.firmwareVersion.c_str());
         cJSON_AddStringToObject(device, "displayName", info.displayName.c_str());
-        
+
         cJSON_AddItemToArray(root, device);
     }
-    
+
     char *json_string = cJSON_Print(root);
     std::string result(json_string);
-    
+
     cJSON_free(json_string);
     cJSON_Delete(root);
 
     return result;
 }
 
+// --- Route Handler Functions ---
+
+
 /**
- * @brief Handles a single HTTP client connection.
+ * @brief Handler for GET /lights/all - returns all discovered devices.
  */
-static void handle_http_request(int client_sock, std::map<std::string, DeviceInfo>* device_map) {
-    const int BUFSIZE = 1024;
-    char buffer[BUFSIZE];
-    
-    // Read the HTTP request
-    int bytes_received = recv(client_sock, buffer, BUFSIZE - 1, 0);
-    if (bytes_received <= 0) {
-        close(client_sock);
-        return;
-    }
-    
-    buffer[bytes_received] = '\0';
-    std::string request(buffer);
-    
-    // Parse the request line (e.g., "GET /lights/all HTTP/1.1")
-    size_t method_end = request.find(' ');
-    size_t path_end = request.find(' ', method_end + 1);
-    
-    if (method_end == std::string::npos || path_end == std::string::npos) {
-        close(client_sock);
-        return;
-    }
-    
-    std::string method = request.substr(0, method_end);
-    std::string path = request.substr(method_end + 1, path_end - method_end - 1);
-    
-    std::string response;
-    
-    if (method == "GET" && path == "/lights/all") {
-        // Generate JSON response
-        std::string json_body = device_map_to_json(*device_map);
-        
-        response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-        response += std::to_string(json_body.length());
-        response += "\r\nConnection: close\r\n\r\n";
-        response += json_body;
-    } else {
-        // 404 Not Found
-        const char* body = "{\"error\":\"Not Found\"}";
-        size_t body_len = 23;
-        response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: ";
-        response += std::to_string(body_len);
-        response += "\r\nConnection: close\r\n\r\n";
-        response += body;
-    }
-    
-    // Send response
-    send(client_sock, response.c_str(), response.length(), 0);
-    close(client_sock);
+static esp_err_t handleGetAllLights(httpd_req_t *req) {
+    auto* device_map = static_cast<std::map<std::string, DeviceInfo>*>(req->user_ctx);
+
+    std::string json = device_map_to_json(device_map);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json.c_str(), json.length());
+
+    return ESP_OK;
 }
 
 /**
- * @brief Task function to handle HTTP server requests.
+ * @brief Handler for GET /elgato/lights - gets light state from specific device.
+ * Requires query parameter: ip=<device_ip>
  */
-void http_server_task(void* pvParameters) {
-    HttpServerConfig* config = (HttpServerConfig*)pvParameters;
-    int server_sock = config->server_socket;
-    std::map<std::string, DeviceInfo>* device_map = config->device_map;
-    
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        
-        int client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_addr_len);
-        
-        if (client_sock < 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        
-        handle_http_request(client_sock, device_map);
+static esp_err_t handleGetLight(httpd_req_t *req) {
+    char query_buf[256];
+    char ip[32];
+
+    if (httpd_req_get_url_query_str(req, query_buf, sizeof(query_buf)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing query parameters\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
+
+    if (httpd_query_key_value(query_buf, "ip", ip, sizeof(ip)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing 'ip' parameter\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ElgatoLight light = getLight(std::string(ip));
+
+    if (!light.error.empty()) {
+        cJSON *error = cJSON_CreateObject();
+        cJSON_AddStringToObject(error, "error", light.error.c_str());
+        char *json_str = cJSON_PrintUnformatted(error);
+
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_str, strlen(json_str));
+
+        cJSON_free(json_str);
+        cJSON_Delete(error);
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "on", light.on);
+    cJSON_AddNumberToObject(root, "brightness", light.brightness);
+    cJSON_AddNumberToObject(root, "temperature", light.temperature);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, strlen(json_str));
+
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler for PUT /elgato/lights - sets light state for specific device.
+ * Requires query parameters: ip=<device_ip>, brightness=<0-100>, temperature=<143-344>
+ */
+static esp_err_t handleSetLight(httpd_req_t *req) {
+    char query_buf[256];
+    char ip[32], brightness_str[8], temperature_str[8];
+
+    if (httpd_req_get_url_query_str(req, query_buf, sizeof(query_buf)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing required parameters: ip, brightness, temperature\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (httpd_query_key_value(query_buf, "ip", ip, sizeof(ip)) != ESP_OK ||
+        httpd_query_key_value(query_buf, "brightness", brightness_str, sizeof(brightness_str)) != ESP_OK ||
+        httpd_query_key_value(query_buf, "temperature", temperature_str, sizeof(temperature_str)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing required parameters: ip, brightness, temperature\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    int brightness = atoi(brightness_str);
+    int temperature = atoi(temperature_str);
+
+    ElgatoLight light = setLight(std::string(ip), brightness, temperature);
+
+    if (!light.error.empty()) {
+        cJSON *error = cJSON_CreateObject();
+        cJSON_AddStringToObject(error, "error", light.error.c_str());
+        char *json_str = cJSON_PrintUnformatted(error);
+        
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_str, strlen(json_str));
+        
+        cJSON_free(json_str);
+        cJSON_Delete(error);
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "on", light.on);
+    cJSON_AddNumberToObject(root, "brightness", light.brightness);
+    cJSON_AddNumberToObject(root, "temperature", light.temperature);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, strlen(json_str));
+
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler for GET /elgato/accessory-info - gets device info.
+ * Requires query parameter: ip=<device_ip>
+ */
+static esp_err_t handleGetInfo(httpd_req_t *req) {
+    char query_buf[256];
+    char ip[32];
+
+    if (httpd_req_get_url_query_str(req, query_buf, sizeof(query_buf)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing query parameters\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (httpd_query_key_value(query_buf, "ip", ip, sizeof(ip)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing 'ip' parameter\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    DeviceInfo info = getInfo(std::string(ip));
+
+    if (!info.error.empty()) {
+        cJSON *error = cJSON_CreateObject();
+        cJSON_AddStringToObject(error, "error", info.error.c_str());
+        char *json_str = cJSON_PrintUnformatted(error);
+
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, json_str, strlen(json_str));
+
+        cJSON_free(json_str);
+        cJSON_Delete(error);
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "productName", info.productName.c_str());
+    cJSON_AddNumberToObject(root, "hardwareBoardType", info.hardwareBoardType);
+    cJSON_AddStringToObject(root, "firmwareVersion", info.firmwareVersion.c_str());
+    cJSON_AddNumberToObject(root, "firmwareBuildNumber", info.firmwareBuildNumber);
+    cJSON_AddStringToObject(root, "serialNumber", info.serialNumber.c_str());
+    cJSON_AddStringToObject(root, "displayName", info.displayName.c_str());
+
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, strlen(json_str));
+
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler for PUT /elgato/accessory-info - sets device name.
+ * Requires query parameters: ip=<device_ip>, name=<new_name>
+ */
+static esp_err_t handleSetDeviceName(httpd_req_t *req) {
+    char query_buf[256];
+    char ip[32], name[128];
+
+    if (httpd_req_get_url_query_str(req, query_buf, sizeof(query_buf)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing required parameters: ip, name\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (httpd_query_key_value(query_buf, "ip", ip, sizeof(ip)) != ESP_OK ||
+        httpd_query_key_value(query_buf, "name", name, sizeof(name)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Missing required parameters: ip, name\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    bool success = setDeviceName(std::string(ip), std::string(name));
+
+    if (!success) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"Failed to set device name\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Registers all API routes with their handler functions.
+ */
+static void registerRoutes(httpd_handle_t server, const std::map<std::string, DeviceInfo>* device_map) {
+    // GET /lights/all
+    httpd_uri_t get_all_lights = {
+        .uri       = "/lights/all",
+        .method    = HTTP_GET,
+        .handler   = handleGetAllLights,
+        .user_ctx  = (void*)device_map
+    };
+    httpd_register_uri_handler(server, &get_all_lights);
+
+    // GET /elgato/lights
+    httpd_uri_t get_light = {
+        .uri       = "/elgato/lights",
+        .method    = HTTP_GET,
+        .handler   = handleGetLight,
+        .user_ctx  = (void*)device_map
+    };
+    httpd_register_uri_handler(server, &get_light);
+
+    // PUT /elgato/lights
+    httpd_uri_t set_light = {
+        .uri       = "/elgato/lights",
+        .method    = HTTP_PUT,
+        .handler   = handleSetLight,
+        .user_ctx  = (void*)device_map
+    };
+    httpd_register_uri_handler(server, &set_light);
+
+    // GET /elgato/accessory-info
+    httpd_uri_t get_info = {
+        .uri       = "/elgato/accessory-info",
+        .method    = HTTP_GET,
+        .handler   = handleGetInfo,
+        .user_ctx  = (void*)device_map
+    };
+    httpd_register_uri_handler(server, &get_info);
+
+    // PUT /elgato/accessory-info
+    httpd_uri_t set_device_name = {
+        .uri       = "/elgato/accessory-info",
+        .method    = HTTP_PUT,
+        .handler   = handleSetDeviceName,
+        .user_ctx  = (void*)device_map
+    };
+    httpd_register_uri_handler(server, &set_device_name);
+
+    ESP_LOGI(TAG, "Registered 5 routes");
 }
 
 /**
  * @brief Starts the HTTP server on port 80.
  */
-int http_server_start(std::map<std::string, DeviceInfo>* device_map) {
+httpd_handle_t http_server_start(const std::map<std::string, DeviceInfo>* device_map) {
     ESP_LOGI(TAG, "Starting HTTP server...");
-    
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        ESP_LOGE(TAG, "Failed to create socket: errno %d", errno);
-        return -1;
+
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.task_priority = 1;
+    config.stack_size = 4096;
+    config.core_id = 0;
+    config.server_port = 80;
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+        return NULL;
     }
-    ESP_LOGI(TAG, "Socket created successfully");
-    
-    // Set socket option to reuse address
-    int opt = 1;
-    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        ESP_LOGW(TAG, "Failed to set SO_REUSEADDR: errno %d", errno);
-    }
-    
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(80);
-    
-    ESP_LOGI(TAG, "Attempting to bind to port 80...");
-    if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        ESP_LOGE(TAG, "Bind failed: errno %d", errno);
-        close(server_sock);
-        return -1;
-    }
-    ESP_LOGI(TAG, "Bind successful");
-    
-    ESP_LOGI(TAG, "Starting listen...");
-    if (listen(server_sock, 5) < 0) {
-        ESP_LOGE(TAG, "Listen failed: errno %d", errno);
-        close(server_sock);
-        return -1;
-    }
-    ESP_LOGI(TAG, "Listen successful");
-    
-    // Create the server task
-    HttpServerConfig* config = new HttpServerConfig();
-    config->server_socket = server_sock;
-    config->device_map = device_map;
-    
-    ESP_LOGI(TAG, "Creating HTTP server task...");
-    BaseType_t task_result = xTaskCreatePinnedToCore(http_server_task, "http_srv", 4096, config, 1, NULL, 0);
-    if (task_result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create HTTP server task");
-        close(server_sock);
-        delete config;
-        return -1;
-    }
-    
-    ESP_LOGI(TAG, "HTTP server started successfully on port 80");
-    return server_sock;
+
+    ESP_LOGI(TAG, "HTTP server started successfully");
+
+    registerRoutes(server, device_map);
+
+    ESP_LOGI(TAG, "HTTP server listening on port 80");
+    return server;
 }

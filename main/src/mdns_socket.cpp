@@ -52,10 +52,14 @@ int mdns_setup_socket()
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    if (sock < 0) {
+        ESP_LOGE(TAG, "mDNS socket setup failed");
+    }
+
     return sock;
 }
 
-ssize_t send_mdns_ptr_query(int sock_mdns, const std::string &qname)
+ssize_t send_mdns_ptr_query(const int &sock_mdns, const std::string &qname)
 {
     if (qname.empty() || sock_mdns < 0) {
         return -1;
@@ -114,7 +118,7 @@ ssize_t send_mdns_ptr_query(int sock_mdns, const std::string &qname)
 // ipv4_addr: your device's IP address as a string
 // port: service port number
 // txt_records: optional key=value pairs for TXT record (can be empty)
-ssize_t send_mdns_announcement(int sock_mdns, const std::string &service_type,
+ssize_t send_mdns_announcement(const int &sock_mdns, const std::string &service_type,
                                 const std::string &instance_name, const std::string &hostname,
                                 const std::string &ipv4_addr, uint16_t port,
                                 const std::vector<std::string> &txt_records)
@@ -253,7 +257,7 @@ ssize_t send_mdns_announcement(int sock_mdns, const std::string &service_type,
 }
 
 // Broadcast a simple mDNS A record announcement (hostname -> IP)
-ssize_t send_mdns_a_record(int sock_mdns, const std::string &hostname, const std::string &ipv4_addr)
+ssize_t send_mdns_a_record(const int &sock_mdns, const std::string &hostname, const std::string &ipv4_addr)
 {
     if (sock_mdns < 0 || hostname.empty() || ipv4_addr.empty()) {
         return -1;
@@ -406,7 +410,7 @@ static std::string normalize_dns_name(const std::string &s) {
 // 1. Listening for service discovery responses (PTR/SRV/A records)
 // 2. Responding to mDNS queries for our hostname
 // This ensures a single thread processes all mDNS socket traffic without conflicts.
-void mdns_socket_task(int sock_mdns, std::string &qname, std::set<std::string> &set_ip, 
+void mdns_socket_task(const int &sock_mdns, const std::string &qname, std::set<std::string> &set_ip, 
                       const std::string &our_hostname, const std::string &our_ip) {
     std::string normalized_qname = normalize_dns_name(qname);
     std::string normalized_hostname = normalize_dns_name(our_hostname);
@@ -415,97 +419,93 @@ void mdns_socket_task(int sock_mdns, std::string &qname, std::set<std::string> &
     const size_t BUF_SZ = 1500;
     uint8_t buf[BUF_SZ];
 
-    // receive responses until timeout
-    while (1) {
-        struct sockaddr_in src;
-        socklen_t slen = sizeof(src);
-        ssize_t len = recvfrom(sock_mdns, buf, BUF_SZ, 0, (struct sockaddr*)&src, &slen);
-        if (len <= 0) {
-            if (len < 0) {
-                // ESP_LOGW(TAG, "recvfrom() error: %s", strerror(errno));
-            } else {
-                ESP_LOGD(TAG, "recvfrom() timeout");
+    // receive ONE packet (caller will call us in a loop)
+    struct sockaddr_in src;
+    socklen_t slen = sizeof(src);
+    ssize_t len = recvfrom(sock_mdns, buf, BUF_SZ, 0, (struct sockaddr*)&src, &slen);
+    if (len <= 0) {
+        if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGW(TAG, "recvfrom() error: %s", strerror(errno));
+        }
+        return; // Timeout or error, return to caller
+    }
+
+    if (len < 12) return; // Too short to be valid DNS
+
+    // Parse DNS header
+    uint16_t flags = read_u16(buf + 2);
+    uint16_t qdcount = read_u16(buf + 4);
+    uint16_t ancount = read_u16(buf + 6);
+    uint16_t nscount = read_u16(buf + 8);
+    uint16_t arcount = read_u16(buf + 10);
+
+    bool is_query = !(flags & 0x8000); // QR bit = 0 means query
+    size_t offset = 12;
+
+    // Process questions (for queries and responses)
+    if (is_query && qdcount > 0) {
+        // This is a query - check if someone is asking for our hostname
+        for (int q = 0; q < qdcount; ++q) {
+            if (offset >= (size_t)len) break;
+
+            std::string qname_parsed = parse_name(buf, len, offset);
+            if (offset + 4 > (size_t)len) break;
+
+            uint16_t qtype = read_u16(buf + offset); offset += 2;
+            uint16_t qclass = read_u16(buf + offset); offset += 2;
+
+            // Check if this is an A record query for our hostname
+            if ((qtype == 1 || qtype == 255) && // A record or ANY
+                (qclass == 1 || qclass == 255) && // IN class or ANY
+                normalize_dns_name(qname_parsed) == normalized_hostname) {
+                
+                ESP_LOGI(TAG, "Received mDNS A query for %s, responding with %s", qname_parsed.c_str(), our_ip.c_str());
+                
+                // Send A record response
+                send_mdns_a_record(sock_mdns, our_hostname, our_ip);
+                break; // Done processing this packet
             }
-            continue;
+        }
+    } else if (!is_query) {
+        // This is a response - process answers for service discovery
+        // Skip questions first
+        for (int q = 0; q < qdcount; ++q) {
+            std::string qname_parsed = parse_name(buf, len, offset);
+            if (offset + 4 > (size_t)len) { offset = len; break; }
+            offset += 4; // qtype + qclass
         }
 
-        if (len < 12) continue; // Too short to be valid DNS
+        bool found_matching_qname = false;
+        // Iterate answers + authorities + additionals
+        int rr_total = ancount + nscount + arcount;
+        for (int rr = 0; rr < rr_total; ++rr) {
+            if (offset >= (size_t)len) break;
+            size_t name_off = offset;
+            (void)name_off;
+            std::string name = parse_name(buf, len, offset);
+            if (offset + 10 > (size_t)len) break;
+            uint16_t type = read_u16(buf + offset); offset += 2;
+            uint16_t clas = read_u16(buf + offset); offset += 2;
+            uint32_t ttl = read_u32(buf + offset); offset += 4;
+            (void)ttl;
+            uint16_t rdlen = read_u16(buf + offset); offset += 2;
 
-        // Parse DNS header
-        uint16_t flags = read_u16(buf + 2);
-        uint16_t qdcount = read_u16(buf + 4);
-        uint16_t ancount = read_u16(buf + 6);
-        uint16_t nscount = read_u16(buf + 8);
-        uint16_t arcount = read_u16(buf + 10);
-        
-        bool is_query = !(flags & 0x8000); // QR bit = 0 means query
-        size_t offset = 12;
+            found_matching_qname |= (normalize_dns_name(name) == normalized_qname);
+            if (offset + rdlen > (size_t)len) break;
 
-        // Process questions (for queries and responses)
-        if (is_query && qdcount > 0) {
-            // This is a query - check if someone is asking for our hostname
-            for (int q = 0; q < qdcount; ++q) {
-                if (offset >= (size_t)len) break;
+            // We are only interested in the A record, the IPv4 of the device on the network
+            if ((clas == 1 || clas == 32769) && type == 1) { // A
+                if (rdlen == 4) {
+                    char ipstr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, buf + offset, ipstr, sizeof(ipstr));
 
-                std::string qname_parsed = parse_name(buf, len, offset);
-                if (offset + 4 > (size_t)len) break;
-                
-                uint16_t qtype = read_u16(buf + offset); offset += 2;
-                uint16_t qclass = read_u16(buf + offset); offset += 2;
-                
-                // Check if this is an A record query for our hostname
-                if ((qtype == 1 || qtype == 255) && // A record or ANY
-                    (qclass == 1 || qclass == 255) && // IN class or ANY
-                    normalize_dns_name(qname_parsed) == normalized_hostname) {
-                    
-                    ESP_LOGI(TAG, "Received mDNS A query for %s, responding with %s", qname_parsed.c_str(), our_ip.c_str());
-                    
-                    // Send A record response
-                    send_mdns_a_record(sock_mdns, our_hostname, our_ip);
-                    break; // Done processing this packet
-                }
-            }
-        } else if (!is_query) {
-            // This is a response - process answers for service discovery
-            // Skip questions first
-            for (int q = 0; q < qdcount; ++q) {
-                std::string qname_parsed = parse_name(buf, len, offset);
-                if (offset + 4 > (size_t)len) { offset = len; break; }
-                offset += 4; // qtype + qclass
-            }
-
-            bool found_matching_qname = false;
-            // Iterate answers + authorities + additionals
-            int rr_total = ancount + nscount + arcount;
-            for (int rr = 0; rr < rr_total; ++rr) {
-                if (offset >= (size_t)len) break;
-                size_t name_off = offset;
-                (void)name_off;
-                std::string name = parse_name(buf, len, offset);
-                if (offset + 10 > (size_t)len) break;
-                uint16_t type = read_u16(buf + offset); offset += 2;
-                uint16_t clas = read_u16(buf + offset); offset += 2;
-                uint32_t ttl = read_u32(buf + offset); offset += 4;
-                (void)ttl;
-                uint16_t rdlen = read_u16(buf + offset); offset += 2;
-
-                found_matching_qname |= (normalize_dns_name(name) == normalized_qname);
-                if (offset + rdlen > (size_t)len) break;
-
-                // We are only interested in the A record, the IPv4 of the device on the network
-                if ((clas == 1 || clas == 32769) && type == 1) { // A
-                    if (rdlen == 4) {
-                        char ipstr[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, buf + offset, ipstr, sizeof(ipstr));
-
-                        if (found_matching_qname) {
-                            set_ip.insert(std::string(ipstr));
-                        }
+                    if (found_matching_qname) {
+                        set_ip.insert(std::string(ipstr));
                     }
                 }
-
-                offset += rdlen;
             }
+
+            offset += rdlen;
         }
     }
 }

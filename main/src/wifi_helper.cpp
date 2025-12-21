@@ -39,7 +39,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-esp_netif_t* wifi_init_station(const std::string& wifi_ssid, const std::string& wifi_password)
+esp_netif_t* wifi_init_station(const std::string &wifi_ssid, const std::string &wifi_password)
 {
     s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
@@ -65,15 +65,17 @@ esp_netif_t* wifi_init_station(const std::string& wifi_ssid, const std::string& 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     
-    // Wait for WiFi connection or failure
+    ESP_LOGI(TAG, "Waiting for WiFi connection (30 second timeout)...");
+
+    // Wait for WiFi connection or failure (30 second timeout instead of forever)
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
-            portMAX_DELAY);
+            pdMS_TO_TICKS(30000)); // 30 second timeout
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected");
+        ESP_LOGI(TAG, "WiFi connected successfully");
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "WiFi connection failed");
     } else {
