@@ -434,7 +434,7 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     request_stream << "User-Agent: CppHttpClient/1.0\r\n";
     request_stream << "Connection: close\r\n"; 
     request_stream << "\r\n"; 
-    
+
     std::string request = request_stream.str();
 
     if (send(sockfd, request.c_str(), request.length(), 0) == -1) {
@@ -464,7 +464,7 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
             return error_result;
         }
     }
-    
+
     close(sockfd); 
 
     // 4. Separate headers from body (Body starts after the first \r\n\r\n)
@@ -475,7 +475,7 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     }
 
     std::string json_body = raw_response.substr(body_start + 4);
-    
+
     // 5. Parse the JSON body
     DeviceInfo info = parseJsonBody(json_body);
     info.ip = host; // Set the IP address field

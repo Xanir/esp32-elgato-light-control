@@ -21,6 +21,7 @@
 #include "mdns_socket.h"
 #include "http_requester.h"
 #include "http_server.h"
+#include "cache_lights.h"
 
 // Ensure TaskConfiguration is declared
 // If not present in mdns_socket.h, uncomment the forward declaration below:
@@ -38,12 +39,17 @@ struct NetworkConfig {
     std::string qname_elgato = "_elg._tcp.local";
     std::string mdns_hostname = "esp32-elgato-lights.local";
     std::string wifi_ip;
+};
+static NetworkConfig* net_config = new NetworkConfig();
 
+struct LightsCache {
     std::set<std::string> discovered_elgato_device_ips;
     std::map<std::string, DeviceInfo> device_ip_to_info_map;
     std::map<std::string, DeviceInfo> device_serial_to_info_map;
+
+    LightGroupCache light_group_cache;
 };
-static NetworkConfig* net_config = new NetworkConfig();
+static LightsCache* lights_cache = new LightsCache();
 
 template <typename KeyType, typename ValueType>
 std::set<KeyType> get_map_keys(const std::map<KeyType, ValueType>& input_map) {
@@ -59,7 +65,7 @@ void mdns_socket_task_wrapper(void* pvParameters) {
     ESP_LOGI(TAG, "mDNS watcher task started");
     while (1) {
         // Unified task handles both service discovery responses AND query responses
-        mdns_socket_task(net_config->mdns_sock, net_config->qname_elgato, net_config->discovered_elgato_device_ips, net_config->mdns_hostname, net_config->wifi_ip);
+        mdns_socket_task(net_config->mdns_sock, net_config->qname_elgato, lights_cache->discovered_elgato_device_ips, net_config->mdns_hostname, net_config->wifi_ip);
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -80,10 +86,10 @@ void spam_mdns_announcements(void* pvParameters) {
 
 void process_ips(void* pvParameters) {
     while (1) {
-        std::set<std::string> known_devices = get_map_keys(net_config->device_ip_to_info_map);
+        std::set<std::string> known_devices = get_map_keys(lights_cache->device_ip_to_info_map);
         std::vector<std::string> needed_ids;
         std::set_difference(
-            net_config->discovered_elgato_device_ips.begin(), net_config->discovered_elgato_device_ips.end(),
+            lights_cache->discovered_elgato_device_ips.begin(), lights_cache->discovered_elgato_device_ips.end(),
             known_devices.begin(), known_devices.end(),
             std::back_inserter(needed_ids)
         );
@@ -98,8 +104,8 @@ void process_ips(void* pvParameters) {
             DeviceInfo info = sendHttpGetRequest(item, 9123, "/elgato/accessory-info");
 
             if (info.error.empty()) {
-                net_config->device_ip_to_info_map[item] = info;
-                net_config->device_serial_to_info_map[info.serialNumber] = info;
+                lights_cache->device_ip_to_info_map[item] = info;
+                lights_cache->device_serial_to_info_map[info.serialNumber] = info;
                 ESP_LOGI(TAG, "Successfully added device: %s", info.serialNumber.c_str());
             } else {
                 ESP_LOGW(TAG, "Failed to get info for %s: %s", item.c_str(), info.error.c_str());
@@ -153,6 +159,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing NVS...");
     initialize_nvs();
     ESP_LOGI(TAG, "NVS initialized");
+
+    // Initialize Light Group Cache
+    ESP_LOGI(TAG, "Initializing Light Group Cache...");
+    lights_cache->light_group_cache.init();
+    ESP_LOGI(TAG, "Light Group Cache initialized");
 
     // Reduce WiFi logging verbosity
     esp_log_level_set("wifi", ESP_LOG_WARN);
@@ -212,7 +223,7 @@ void app_main(void) {
 
     // 6. Start HTTP server
     ESP_LOGI(TAG, "Starting HTTP server...");
-    static httpd_handle_t http_server = http_server_start(&net_config->device_ip_to_info_map);
+    static httpd_handle_t http_server = http_server_start(&lights_cache->device_ip_to_info_map, &lights_cache->device_serial_to_info_map, &lights_cache->light_group_cache);
     if (http_server == NULL) {
         ESP_LOGE(TAG, "HTTP server failed to start - halting");
         stall_app();
@@ -223,7 +234,7 @@ void app_main(void) {
     while (1) {
 
         ESP_LOGI(TAG, "Devices: %d, Free heap: %lu bytes", 
-                net_config->device_ip_to_info_map.size(),
+                lights_cache->device_ip_to_info_map.size(),
                 esp_get_free_heap_size());
 
         vTaskDelay(pdMS_TO_TICKS(1000));

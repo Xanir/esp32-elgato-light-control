@@ -12,7 +12,7 @@ const std::string APP_NVS_NS = "elights";
  */
 esp_err_t initialize_nvs() {
     esp_err_t ret = nvs_flash_init();
-    
+
     // Check if the partition is corrupted or not formatted
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase()); // Erase the partition
@@ -77,7 +77,7 @@ std::string get_nvs_string_value(const std::string& key) {
     }
 
     err = nvs_get_str(nvs_handle, key.c_str(), buffer, &required_size);
-    
+
     if (err == ESP_OK) {
         result = buffer; // Convert C-string to std::string
     }

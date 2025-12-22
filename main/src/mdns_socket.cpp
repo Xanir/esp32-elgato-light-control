@@ -130,7 +130,7 @@ ssize_t send_mdns_announcement(const int &sock_mdns, const std::string &service_
 
     std::vector<uint8_t> response;
     response.resize(12); // DNS header
-    
+
     // ID = 0 for mDNS
     response[0] = 0; response[1] = 0;
     // Flags = 0x8400 (response, authoritative)
@@ -265,7 +265,7 @@ ssize_t send_mdns_a_record(const int &sock_mdns, const std::string &hostname, co
 
     std::vector<uint8_t> response;
     response.resize(12); // DNS header
-    
+
     // ID = 0 for mDNS
     response[0] = 0; response[1] = 0;
     // Flags = 0x8400 (response, authoritative)
@@ -318,7 +318,7 @@ ssize_t send_mdns_a_record(const int &sock_mdns, const std::string &hostname, co
     push_u16(0x8001);  // CLASS = IN with cache-flush bit
     push_u32(120);  // TTL = 120 seconds
     push_u16(4);  // RDLENGTH = 4 bytes for IPv4
-    
+
     struct in_addr addr;
     if (inet_pton(AF_INET, ipv4_addr.c_str(), &addr) == 1) {
         response.push_back((addr.s_addr >> 0) & 0xFF);
@@ -458,9 +458,9 @@ void mdns_socket_task(const int &sock_mdns, const std::string &qname, std::set<s
             if ((qtype == 1 || qtype == 255) && // A record or ANY
                 (qclass == 1 || qclass == 255) && // IN class or ANY
                 normalize_dns_name(qname_parsed) == normalized_hostname) {
-                
+
                 ESP_LOGI(TAG, "Received mDNS A query for %s, responding with %s", qname_parsed.c_str(), our_ip.c_str());
-                
+
                 // Send A record response
                 send_mdns_a_record(sock_mdns, our_hostname, our_ip);
                 break; // Done processing this packet

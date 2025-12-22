@@ -64,7 +64,7 @@ esp_netif_t* wifi_init_station(const std::string &wifi_ssid, const std::string &
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    
+
     ESP_LOGI(TAG, "Waiting for WiFi connection (30 second timeout)...");
 
     // Wait for WiFi connection or failure (30 second timeout instead of forever)
@@ -81,7 +81,7 @@ esp_netif_t* wifi_init_station(const std::string &wifi_ssid, const std::string &
     } else {
         ESP_LOGE(TAG, "WiFi unexpected event");
     }
-    
+
     return s_sta_netif;
 }
 
