@@ -61,7 +61,7 @@ void mdns_socket_task_wrapper(void* pvParameters) {
         // Unified task handles both service discovery responses AND query responses
         mdns_socket_task(net_config->mdns_sock, net_config->qname_elgato, net_config->discovered_elgato_device_ips, net_config->mdns_hostname, net_config->wifi_ip);
 
-        vTaskDelay(pdMS_TO_TICKS(100)); // Changed from 1 tick to 100ms to prevent watchdog issues
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -75,6 +75,38 @@ void spam_mdns_announcements(void* pvParameters) {
         send_mdns_ptr_query(net_config->mdns_sock, net_config->qname_elgato);
 
         vTaskDelay(pdMS_TO_TICKS(30000)); // Announce every 10 seconds
+    }
+}
+
+void process_ips(void* pvParameters) {
+    while (1) {
+        std::set<std::string> known_devices = get_map_keys(net_config->device_ip_to_info_map);
+        std::vector<std::string> needed_ids;
+        std::set_difference(
+            net_config->discovered_elgato_device_ips.begin(), net_config->discovered_elgato_device_ips.end(),
+            known_devices.begin(), known_devices.end(),
+            std::back_inserter(needed_ids)
+        );
+
+        if (!needed_ids.empty()) {
+            ESP_LOGI(TAG, "Found %d new devices to query", needed_ids.size());
+        }
+
+        for (const std::string& item : needed_ids) {
+            ESP_LOGI(TAG, "Getting light data for %s", item.c_str());
+            vTaskDelay(pdMS_TO_TICKS(100));
+            DeviceInfo info = sendHttpGetRequest(item, 9123, "/elgato/accessory-info");
+
+            if (info.error.empty()) {
+                net_config->device_ip_to_info_map[item] = info;
+                net_config->device_serial_to_info_map[info.serialNumber] = info;
+                ESP_LOGI(TAG, "Successfully added device: %s", info.serialNumber.c_str());
+            } else {
+                ESP_LOGW(TAG, "Failed to get info for %s: %s", item.c_str(), info.error.c_str());
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -154,7 +186,7 @@ void app_main(void) {
     gpio_set_level(BLINK_GPIO, LED_ON_LEVEL);
     ESP_LOGI(TAG, "WiFi initialization complete");
 
-    // 6. Create the mDNS socket
+    // 5. Create the mDNS socket
     ESP_LOGI(TAG, "Setting up mDNS socket...");
     net_config->mdns_sock = mdns_setup_socket();
     ESP_LOGI(TAG, "mDNS socket created successfully");
@@ -162,17 +194,23 @@ void app_main(void) {
     // Prepare task configuration and provide a pointer to the shared set so
     // the mdns task updates `s_discovered_mdns_ips` directly.
     ESP_LOGI(TAG, "Creating mDNS tasks...");
-    if (xTaskCreatePinnedToCore(mdns_socket_task_wrapper, "mdns_watcher_task", 4096, net_config, 5, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(mdns_socket_task_wrapper, "mdns_watcher_task", 4096, net_config, 4, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create mDNS watcher task");
         stall_app();
     }
-    if (xTaskCreatePinnedToCore(spam_mdns_announcements, "mdns_announcements", 4096, net_config, 1, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(spam_mdns_announcements, "mdns_announcements", 4096, net_config, 9, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create mDNS announcement task");
         stall_app();
     }
     ESP_LOGI(TAG, "mDNS tasks created successfully");
 
-    // 5. Start HTTP server
+    if (xTaskCreatePinnedToCore(process_ips, "process_ips", 4096, NULL, 7, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create IP resolution task");
+        stall_app();
+    }
+    ESP_LOGI(TAG, "IP resolution task created successfully");
+
+    // 6. Start HTTP server
     ESP_LOGI(TAG, "Starting HTTP server...");
     static httpd_handle_t http_server = http_server_start(&net_config->device_ip_to_info_map);
     if (http_server == NULL) {
@@ -183,30 +221,10 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "Entering main loop - monitoring for Elgato devices");
     while (1) {
-        std::set<std::string> known_devices = get_map_keys(net_config->device_ip_to_info_map);
-        std::vector<std::string> needed_ids;
-        std::set_difference(
-            net_config->discovered_elgato_device_ips.begin(), net_config->discovered_elgato_device_ips.end(),
-            known_devices.begin(), known_devices.end(),
-            std::back_inserter(needed_ids)
-        );
 
-        if (!needed_ids.empty()) {
-            ESP_LOGI(TAG, "Found %d new devices to query", needed_ids.size());
-        }
-
-        for (const std::string& item : needed_ids) {
-            ESP_LOGI(TAG, "Getting light data for %s", item.c_str());
-            DeviceInfo info = sendHttpGetRequest(item, 9123, "/elgato/accessory-info");
-
-            if (info.error.empty()) {
-                net_config->device_ip_to_info_map[item] = info;
-                net_config->device_serial_to_info_map[info.serialNumber] = info;
-                ESP_LOGI(TAG, "Successfully added device: %s", info.serialNumber.c_str());
-            } else {
-                ESP_LOGW(TAG, "Failed to get info for %s: %s", item.c_str(), info.error.c_str());
-            }
-        }
+        ESP_LOGI(TAG, "Devices: %d, Free heap: %lu bytes", 
+                net_config->device_ip_to_info_map.size(),
+                esp_get_free_heap_size());
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

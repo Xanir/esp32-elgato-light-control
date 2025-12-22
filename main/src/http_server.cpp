@@ -14,6 +14,19 @@ extern "C" {
 
 static const char* TAG = "HTTP_SERVER";
 
+// Add a cached JSON response that's updated periodically
+struct ServerCache {
+    std::string cached_devices_json;
+    SemaphoreHandle_t mutex;
+
+    ServerCache() {
+        mutex = xSemaphoreCreateMutex();
+        cached_devices_json = "[]";
+    }
+};
+
+static ServerCache* server_cache = nullptr;
+
 // --- Utility Functions ---
 
 /**
@@ -53,11 +66,25 @@ static std::string device_map_to_json(const std::map<std::string, DeviceInfo> *d
 
 /**
  * @brief Handler for GET /lights/all - returns all discovered devices.
+ * Now uses cached response for instant, non-blocking replies.
  */
 static esp_err_t handleGetAllLights(httpd_req_t *req) {
-    auto* device_map = static_cast<std::map<std::string, DeviceInfo>*>(req->user_ctx);
+    if (!server_cache) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "{\"error\":\"Server cache not initialized\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
 
-    std::string json = device_map_to_json(device_map);
+    // Use cached JSON instead of generating on-the-fly
+    std::string json;
+    if (xSemaphoreTake(server_cache->mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        json = server_cache->cached_devices_json;
+        xSemaphoreGive(server_cache->mutex);
+    } else {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_send(req, "{\"error\":\"Cache busy\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json.c_str(), json.length());
@@ -326,26 +353,65 @@ static void registerRoutes(httpd_handle_t server, const std::map<std::string, De
 }
 
 /**
+ * @brief Background task to update cached device JSON periodically.
+ */
+void update_device_cache_task(void* pvParameters) {
+    auto* device_map = static_cast<const std::map<std::string, DeviceInfo>*>(pvParameters);
+
+    ESP_LOGI(TAG, "Device cache update task started");
+
+    while (1) {
+        std::string new_json = device_map_to_json(device_map);
+
+        if (xSemaphoreTake(server_cache->mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            server_cache->cached_devices_json = new_json;
+            xSemaphoreGive(server_cache->mutex);
+            ESP_LOGD(TAG, "Updated device cache (%d bytes)", new_json.length());
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Update every 2 seconds
+    }
+}
+
+/**
  * @brief Starts the HTTP server on port 80.
  */
 httpd_handle_t http_server_start(const std::map<std::string, DeviceInfo>* device_map) {
     ESP_LOGI(TAG, "Starting HTTP server...");
 
+    // Initialize cache
+    server_cache = new ServerCache();
+
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.task_priority = 1;
-    config.stack_size = 4096;
+    config.stack_size = 8192;
     config.core_id = 0;
     config.server_port = 80;
+    config.max_open_sockets = 4;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
 
-    if (httpd_start(&server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
+    esp_err_t err = httpd_start(&server, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server: %s (0x%x)", esp_err_to_name(err), err);
         return NULL;
     }
 
     ESP_LOGI(TAG, "HTTP server started successfully");
 
     registerRoutes(server, device_map);
+
+    // Start background task to update cache
+    xTaskCreatePinnedToCore(
+        update_device_cache_task,
+        "device_cache_updater",
+        4096,
+        (void*)device_map,
+        2,  // Lower priority than HTTP server
+        NULL,
+        0
+    );
 
     ESP_LOGI(TAG, "HTTP server listening on port 80");
     return server;

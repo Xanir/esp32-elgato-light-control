@@ -127,6 +127,7 @@ std::string sendHttpPutRequest(const std::string &host, const int &port, const s
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     // 2. Construct and send the HTTP PUT request
     std::stringstream request_stream;
@@ -149,7 +150,7 @@ std::string sendHttpPutRequest(const std::string &host, const int &port, const s
     // 3. Receive the response
     std::string raw_response;
     const int BUFSIZE = 1024;
-    static char buffer[BUFSIZE];
+    char buffer[BUFSIZE];  // Local buffer, not static
     int bytes_received;
 
     while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
@@ -298,6 +299,7 @@ ElgatoLight getLight(const std::string &ip) {
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     std::stringstream request_stream;
     request_stream << "GET /elgato/lights HTTP/1.1\r\n";
@@ -315,7 +317,7 @@ ElgatoLight getLight(const std::string &ip) {
 
     std::string raw_response;
     const int BUFSIZE = 1024;
-    static char buffer[BUFSIZE];
+    char buffer[BUFSIZE];
     int bytes_received;
 
     while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
@@ -394,11 +396,17 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     }
 
     // Loop through all results and connect
+    int last_socket_errno = 0;
+    int last_connect_errno = 0;
     for(p = server_info; p != NULL; p = p->ai_next) {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            last_socket_errno = errno;
+            ESP_LOGW(TAG, "Socket creation failed: errno %d (%s)", errno, strerror(errno));
             continue; 
         }
         if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            last_connect_errno = errno;
+            ESP_LOGW(TAG, "Connection failed to %s:%d - errno %d (%s)", host.c_str(), port, errno, strerror(errno));
             close(sockfd);
             continue; 
         }
@@ -407,7 +415,8 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     freeaddrinfo(server_info); 
 
     if (p == NULL) {
-        error_result.error = "Failed to connect to host.";
+        error_result.error = "Failed to connect to host. Socket errno: " + std::to_string(last_socket_errno) + 
+                            ", Connect errno: " + std::to_string(last_connect_errno);
         return error_result;
     }
 
@@ -416,6 +425,7 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     // 2. Construct and send the HTTP GET request
     std::stringstream request_stream;
@@ -436,7 +446,7 @@ DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const st
     // 3. Receive the raw response
     std::string raw_response;
     const int BUFSIZE = 1024;
-    static char buffer[BUFSIZE];
+    char buffer[BUFSIZE];  // Local buffer, not static
     int bytes_received;
 
     while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
