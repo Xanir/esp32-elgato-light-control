@@ -3,17 +3,14 @@
 #include <errno.h>
 #include <sstream>
 
-// POSIX socket headers (for Linux/macOS. For Windows, you'd use Winsock2.h)
-#include <sys/socket.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_http_client.h"
 
 extern "C" {
     #include <cJSON.h>
 }
 
-#include "esp_log.h"
 #include "http_requester.h"
 
 // --- Data Structure for Parsed Response ---
@@ -88,86 +85,71 @@ DeviceInfo parseJsonBody(const std::string &json_body) {
  * @brief Sends an HTTP PUT request with JSON body to a specified host, port, and path.
  */
 std::string sendHttpPutRequest(const std::string &host, const int &port, const std::string &path, const std::string &json_body) {
-    struct addrinfo hints, *server_info, *p;
-    int sockfd = -1;
+    int64_t start_time = esp_timer_get_time();
 
-    // 1. Resolve hostname/IP and prepare connection info
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    // Construct full URL
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s:%d%s", host.c_str(), port, path.c_str());
 
-    std::string port_str = std::to_string(port);
+    // Configure HTTP client
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 2000;
+    config.keep_alive_enable = true;
 
-    int rv = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &server_info);
-    if (rv != 0) {
-        ESP_LOGE(TAG, "Host resolution failed for PUT request");
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
         return "";
     }
 
-    // Loop through all results and connect
-    for(p = server_info; p != NULL; p = p->ai_next) {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-            continue;
+    // Set PUT method and headers
+    esp_http_client_set_method(client, HTTP_METHOD_PUT);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+
+    // Open connection and write request body
+    esp_err_t err = esp_http_client_open(client, json_body.length());
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return "";
+    }
+
+    // Write request body
+    int wlen = esp_http_client_write(client, json_body.c_str(), json_body.length());
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Failed to write request body");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return "";
+    }
+
+    // Fetch response headers
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+
+    std::string response;
+    if (status >= 200 && status < 300) {
+        // Read response data
+        char buffer[1024];
+        int read_len;
+
+        while ((read_len = esp_http_client_read(client, buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[read_len] = '\0';
+            response.append(buffer, read_len);
         }
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
-            continue;
-        }
-        break;
-    }
-    freeaddrinfo(server_info);
 
-    if (p == NULL) {
-        ESP_LOGE(TAG, "Failed to connect to host for PUT request");
-        return "";
+        int64_t elapsed_ms = (esp_timer_get_time() - start_time) / 1000;
+        ESP_LOGI(TAG, "PUT request to %s completed in %lld ms (status=%d)", 
+                 url, elapsed_ms, status);
+    } else {
+        ESP_LOGE(TAG, "PUT request failed with HTTP %d", status);
     }
 
-    // Set socket receive timeout
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    esp_http_client_close(client);
 
-    // 2. Construct and send the HTTP PUT request
-    std::stringstream request_stream;
-    request_stream << "PUT " << path << " HTTP/1.1\r\n";
-    request_stream << "Host: " << host << "\r\n";
-    request_stream << "Content-Type: application/json\r\n";
-    request_stream << "Content-Length: " << json_body.length() << "\r\n";
-    request_stream << "Connection: close\r\n";
-    request_stream << "\r\n";
-    request_stream << json_body;
-
-    std::string request = request_stream.str();
-
-    if (send(sockfd, request.c_str(), request.length(), 0) == -1) {
-        close(sockfd);
-        ESP_LOGE(TAG, "Failed to send PUT request");
-        return "";
-    }
-
-    // 3. Receive the response
-    std::string raw_response;
-    const int BUFSIZE = 1024;
-    char buffer[BUFSIZE];  // Local buffer, not static
-    int bytes_received;
-
-    while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        raw_response.append(buffer, bytes_received);
-    }
-
-    close(sockfd);
-
-    // 4. Separate headers from body
-    size_t body_start = raw_response.find("\r\n\r\n");
-    if (body_start == std::string::npos) {
-        ESP_LOGE(TAG, "Invalid HTTP response format in PUT request");
-        return "";
-    }
-
-    return raw_response.substr(body_start + 4);
+    esp_http_client_cleanup(client);
+    return response;
 }
 
 // --- Elgato API Functions ---
@@ -211,7 +193,7 @@ ElgatoLight parseElgatoLightsResponse(const std::string &json_body) {
     return light;
 }
 
-ElgatoLight setLight(const std::string &ip, int brightness, int temperature) {
+ElgatoLight setLight(const std::string &ip, int brightness, std::optional<int> temperature) {
     ElgatoLight light;
 
     // Validate parameters
@@ -221,7 +203,7 @@ ElgatoLight setLight(const std::string &ip, int brightness, int temperature) {
         return light;
     }
 
-    if (temperature < 143 || temperature > 344) {
+    if (temperature.has_value() && (temperature.value() < 143 || temperature.value() > 344)) {
         light.error = "Temperature must be between 143 and 344";
         ESP_LOGE(TAG, "%s", light.error.c_str());
         return light;
@@ -233,9 +215,14 @@ ElgatoLight setLight(const std::string &ip, int brightness, int temperature) {
 
     cJSON *lights_array = cJSON_CreateArray();
     cJSON *light_obj = cJSON_CreateObject();
-    cJSON_AddNumberToObject(light_obj, "on", 1);
+    cJSON_AddNumberToObject(light_obj, "on", brightness > 0 ? 1 : 0);
     cJSON_AddNumberToObject(light_obj, "brightness", brightness);
-    cJSON_AddNumberToObject(light_obj, "temperature", temperature);
+
+    // Only add temperature if provided
+    if (temperature.has_value()) {
+        cJSON_AddNumberToObject(light_obj, "temperature", temperature.value());
+    }
+
     cJSON_AddItemToArray(lights_array, light_obj);
     cJSON_AddItemToObject(root, "lights", lights_array);
 
@@ -260,82 +247,60 @@ ElgatoLight setLight(const std::string &ip, int brightness, int temperature) {
 ElgatoLight getLight(const std::string &ip) {
     ElgatoLight light;
 
-    // Send GET request using existing function but parse differently
-    struct addrinfo hints, *server_info, *p;
-    int sockfd = -1;
+    // Construct URL
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s:9123/elgato/lights", ip.c_str());
 
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    // Configure HTTP client
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 2000;
+    config.keep_alive_enable = true;
 
-    std::string port_str = "9123";
-
-    int rv = getaddrinfo(ip.c_str(), port_str.c_str(), &hints, &server_info);
-    if (rv != 0) {
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
         light.error = "Failed request: Getting light info for " + ip;
         ESP_LOGE(TAG, "%s", light.error.c_str());
         return light;
     }
 
-    for(p = server_info; p != NULL; p = p->ai_next) {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-            continue;
+    // Open connection
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        light.error = "Failed to open: " + std::string(esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s", light.error.c_str());
+        esp_http_client_cleanup(client);
+        return light;
+    }
+
+    // Fetch headers
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+
+    if (status >= 200 && status < 300) {
+        // Read response data
+        char buffer[1024];
+        int read_len;
+        std::string json_body;
+
+        while ((read_len = esp_http_client_read(client, buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[read_len] = '\0';
+            json_body.append(buffer, read_len);
         }
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sockfd);
-            continue;
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        if (!json_body.empty()) {
+            return parseElgatoLightsResponse(json_body);
         }
-        break;
-    }
-    freeaddrinfo(server_info);
-
-    if (p == NULL) {
-        light.error = "Failed request: Getting light info for " + ip;
-        ESP_LOGE(TAG, "%s", light.error.c_str());
-        return light;
     }
 
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-    std::stringstream request_stream;
-    request_stream << "GET /elgato/lights HTTP/1.1\r\n";
-    request_stream << "Host: " << ip << "\r\n";
-    request_stream << "Connection: close\r\n\r\n";
-
-    std::string request = request_stream.str();
-
-    if (send(sockfd, request.c_str(), request.length(), 0) == -1) {
-        close(sockfd);
-        light.error = "Failed request: Getting light info for " + ip;
-        ESP_LOGE(TAG, "%s", light.error.c_str());
-        return light;
-    }
-
-    std::string raw_response;
-    const int BUFSIZE = 1024;
-    char buffer[BUFSIZE];
-    int bytes_received;
-
-    while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        raw_response.append(buffer, bytes_received);
-    }
-
-    close(sockfd);
-
-    size_t body_start = raw_response.find("\r\n\r\n");
-    if (body_start == std::string::npos) {
-        light.error = "Invalid HTTP response format";
-        ESP_LOGE(TAG, "%s", light.error.c_str());
-        return light;
-    }
-
-    std::string json_body = raw_response.substr(body_start + 4);
-    return parseElgatoLightsResponse(json_body);
+    light.error = "HTTP " + std::to_string(status);
+    ESP_LOGE(TAG, "GET light failed with status %d", status);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return light;
 }
 
 DeviceInfo getInfo(const std::string &ip) {
@@ -378,107 +343,72 @@ bool setDeviceName(const std::string &ip, const std::string &name) {
  */
 DeviceInfo sendHttpGetRequest(const std::string &host, const int &port, const std::string &path) {
     DeviceInfo error_result;
-    struct addrinfo hints, *server_info, *p;
-    int sockfd = -1;
 
-    // 1. Resolve hostname/IP and prepare connection info
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;        // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM;    // TCP stream sockets
+    // Construct URL
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s:%d%s", host.c_str(), port, path.c_str());
 
-    std::string port_str = std::to_string(port);
+    // Configure HTTP client
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.timeout_ms = 2000;
+    config.keep_alive_enable = true;
 
-    int rv = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &server_info);
-    if (rv != 0) {
-        // Avoid using gai_strerror (may not be available on this toolchain).
-        error_result.error = "Host resolution failed: error code " + std::to_string(rv);
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        error_result.error = "Failed to initialize HTTP client";
+        ESP_LOGE(TAG, "%s", error_result.error.c_str());
         return error_result;
     }
 
-    // Loop through all results and connect
-    int last_socket_errno = 0;
-    int last_connect_errno = 0;
-    for(p = server_info; p != NULL; p = p->ai_next) {
-        if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-            last_socket_errno = errno;
-            ESP_LOGW(TAG, "Socket creation failed: errno %d (%s)", errno, strerror(errno));
-            continue; 
+    // Open connection and fetch headers
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        error_result.error = "Failed to open connection: " + std::string(esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s", error_result.error.c_str());
+        esp_http_client_cleanup(client);
+        return error_result;
+    }
+
+    // Fetch headers
+    int content_length = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+
+    ESP_LOGI(TAG, "GET %s -> HTTP %d (Content-Length: %d)", url, status, content_length);
+
+    if (status >= 200 && status < 300) {
+        // Read response body
+        char buffer[2048];
+        int total_read = 0;
+        int read_len;
+        std::string json_body;
+
+        while ((read_len = esp_http_client_read(client, buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[read_len] = '\0';
+            json_body.append(buffer, read_len);
+            total_read += read_len;
         }
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-            last_connect_errno = errno;
-            ESP_LOGW(TAG, "Connection failed to %s:%d - errno %d (%s)", host.c_str(), port, errno, strerror(errno));
-            close(sockfd);
-            continue; 
-        }
-        break; // Success
-    }
-    freeaddrinfo(server_info); 
 
-    if (p == NULL) {
-        error_result.error = "Failed to connect to host. Socket errno: " + std::to_string(last_socket_errno) + 
-                            ", Connect errno: " + std::to_string(last_connect_errno);
-        return error_result;
-    }
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
 
-    // Set socket receive timeout to prevent hanging
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        if (!json_body.empty()) {
+            ESP_LOGI(TAG, "Successfully read %d bytes", total_read);
 
-    // 2. Construct and send the HTTP GET request
-    std::stringstream request_stream;
-    request_stream << "GET " << path << " HTTP/1.1\r\n";
-    request_stream << "Host: " << host << "\r\n";
-    request_stream << "User-Agent: CppHttpClient/1.0\r\n";
-    request_stream << "Connection: close\r\n"; 
-    request_stream << "\r\n"; 
-
-    std::string request = request_stream.str();
-
-    if (send(sockfd, request.c_str(), request.length(), 0) == -1) {
-        close(sockfd);
-        error_result.error = "Failed to send request: " + std::string(strerror(errno));
-        return error_result;
-    }
-
-    // 3. Receive the raw response
-    std::string raw_response;
-    const int BUFSIZE = 1024;
-    char buffer[BUFSIZE];  // Local buffer, not static
-    int bytes_received;
-
-    while ((bytes_received = recv(sockfd, buffer, BUFSIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        raw_response.append(buffer, bytes_received);
-    }
-
-    if (bytes_received == -1) {
-        int err = errno;
-        close(sockfd);
-        if ((err == EAGAIN || err == EWOULDBLOCK) && !raw_response.empty()) {
-            // Timeout but got data, continue
+            // Parse the JSON body
+            DeviceInfo info = parseJsonBody(json_body);
+            info.ip = host;
+            return info;
         } else {
-            error_result.error = "Recv fail";
-            return error_result;
+            error_result.error = "Empty response body";
+            ESP_LOGE(TAG, "%s", error_result.error.c_str());
         }
+    } else {
+        error_result.error = "HTTP status " + std::to_string(status);
+        ESP_LOGE(TAG, "Bad HTTP status: %d", status);
+        esp_http_client_close(client);
     }
 
-    close(sockfd); 
-
-    // 4. Separate headers from body (Body starts after the first \r\n\r\n)
-    size_t body_start = raw_response.find("\r\n\r\n");
-    if (body_start == std::string::npos) {
-        error_result.error = "Invalid HTTP response format (no end of headers).";
-        return error_result;
-    }
-
-    std::string json_body = raw_response.substr(body_start + 4);
-
-    // 5. Parse the JSON body
-    DeviceInfo info = parseJsonBody(json_body);
-    info.ip = host; // Set the IP address field
-
-    return info;
+    esp_http_client_cleanup(client);
+    return error_result;
 }

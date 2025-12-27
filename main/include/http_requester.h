@@ -3,6 +3,7 @@
 
 #include <string>
 #include <sstream>
+#include <optional>
 
 /**
  * @brief Structure to hold the parsed device information from the JSON response.
@@ -75,10 +76,10 @@ std::string sendHttpPutRequest(const std::string &host, const int &port, const s
  *
  * @param ip The IP address of the Elgato light.
  * @param brightness The brightness level (0-100).
- * @param temperature The color temperature in mireds (143-344).
+ * @param temperature Optional color temperature in mireds (143-344). If not provided, temperature won't be changed.
  * @return ElgatoLight struct with the updated state, or error message in 'error' field.
  */
-ElgatoLight setLight(const std::string &ip, int brightness, int temperature);
+ElgatoLight setLight(const std::string &ip, int brightness, std::optional<int> temperature = std::nullopt);
 
 /**
  * @brief Gets the current light state from an Elgato light.

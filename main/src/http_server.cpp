@@ -394,6 +394,77 @@ static esp_err_t handleControlLightGroup(httpd_req_t *req) {
 }
 
 /**
+ * @brief Handler for PUT /lights/off - turns off all known lights.
+ */
+static esp_err_t handleLightsOff(httpd_req_t *req) {
+    ServerContext* ctx = (ServerContext*)req->user_ctx;
+
+    ESP_LOGI(TAG, "Received PUT /lights/off request");
+
+    if (ctx->device_map->empty()) {
+        ESP_LOGW(TAG, "No devices available to turn off");
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"error\":\"No devices found\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Turning off %d devices", ctx->device_map->size());
+
+    // Turn off all lights
+    int successCount = 0;
+    int failCount = 0;
+    cJSON *results = cJSON_CreateArray();
+
+    for (const auto& pair : *ctx->device_map) {
+        const DeviceInfo& deviceInfo = pair.second;
+        ESP_LOGI(TAG, "Turning off: %s (%s)", deviceInfo.displayName.c_str(), deviceInfo.ip.c_str());
+
+        // Set brightness to 0 without changing temperature
+        ElgatoLight light = setLight(deviceInfo.ip, 0);
+
+        if (light.error.empty()) {
+            successCount++;
+            ESP_LOGI(TAG, "Successfully turned off %s", deviceInfo.displayName.c_str());
+
+            cJSON *result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "serial", deviceInfo.serialNumber.c_str());
+            cJSON_AddStringToObject(result, "displayName", deviceInfo.displayName.c_str());
+            cJSON_AddBoolToObject(result, "success", true);
+            cJSON_AddItemToArray(results, result);
+        } else {
+            failCount++;
+            ESP_LOGW(TAG, "Failed to turn off %s: %s", deviceInfo.displayName.c_str(), light.error.c_str());
+
+            cJSON *result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "serial", deviceInfo.serialNumber.c_str());
+            cJSON_AddStringToObject(result, "displayName", deviceInfo.displayName.c_str());
+            cJSON_AddBoolToObject(result, "success", false);
+            cJSON_AddStringToObject(result, "error", light.error.c_str());
+            cJSON_AddItemToArray(results, result);
+        }
+    }
+
+    // Build response
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddNumberToObject(response, "totalDevices", ctx->device_map->size());
+    cJSON_AddNumberToObject(response, "successCount", successCount);
+    cJSON_AddNumberToObject(response, "failCount", failCount);
+    cJSON_AddItemToObject(response, "results", results);
+
+    char *json_str = cJSON_PrintUnformatted(response);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, strlen(json_str));
+
+    cJSON_free(json_str);
+    cJSON_Delete(response);
+
+    ESP_LOGI(TAG, "Lights off completed: %d success, %d failed", successCount, failCount);
+
+    return ESP_OK;
+}
+
+/**
  * @brief Registers all API routes with their handler functions.
  */
 static void registerRoutes(httpd_handle_t server, ServerContext* ctx) {
@@ -433,7 +504,16 @@ static void registerRoutes(httpd_handle_t server, ServerContext* ctx) {
     };
     httpd_register_uri_handler(server, &set_light_group);
 
-    ESP_LOGI(TAG, "Registered 8 routes");
+    // PUT /lights/off - turn off all lights
+    httpd_uri_t lights_off = {
+        .uri       = "/lights/off",
+        .method    = HTTP_PUT,
+        .handler   = handleLightsOff,
+        .user_ctx  = (void*)ctx
+    };
+    httpd_register_uri_handler(server, &lights_off);
+
+    ESP_LOGI(TAG, "Registered 9 routes");
 }
 
 /**

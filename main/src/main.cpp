@@ -215,7 +215,7 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "mDNS tasks created successfully");
 
-    if (xTaskCreatePinnedToCore(process_ips, "process_ips", 4096, NULL, 7, NULL, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(process_ips, "process_ips", 8192, NULL, 7, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create IP resolution task");
         stall_app();
     }
