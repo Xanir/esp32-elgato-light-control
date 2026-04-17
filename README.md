@@ -1,6 +1,6 @@
 # ESP32 Elgato Light Control
 
-ESP-IDF firmware for an ESP32 (configured for Seeed XIAO ESP32-C6) that discovers Elgato lights on your LAN and exposes a local HTTP API to control them individually by group.
+ESP-IDF firmware for an ESP32 (configured for Seeed XIAO ESP32-C6) that discovers Elgato lights on your LAN and exposes a local HTTP API to control them by group.
 
 ## mDNS name
 
@@ -116,9 +116,9 @@ Base URL:
 }
 ```
 
-- **Validation constraints** (enforced by downstream Elgato request logic):
+- **Validation constraints**:
   - `brightness`: `0..100`
-  - `temperature`: `143..344`
+  - `temperature`: required for this endpoint and must be `143..344`
 
 - **Success response**:
 
